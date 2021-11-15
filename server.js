@@ -3,19 +3,14 @@
 const fs = require('fs');
 const mkdirp = require('mkdirp');
 const os = require("os");
-const datagram = require('dgram');
-const express = require('express');
-const bodyParser = require('body-parser');
+var net = require('net');
 const axios = require('axios');
-const mqtt = require('mqtt');
 
 const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
-const MQTT_BROKER = process.env.MQTT_BROKER;
-const GATEWAY = process.env.GATEWAY || 'https://relay.free.beeceptor.com'
+const GATEWAY = process.env.GATEWAY || 'https://tcptest.free.beeceptor.com'
 const API_KEY = process.env.API_KEY || ''
-const HOME_DIRECTORY = process.env.MESSAGE_DIRECTORY || '/var/iot_relay';
-const HTTP_PORT = process.env.HTTP_PORT || 3553
-const UDP_PORT = process.env.UDP_PORT || 54545
+const HOME_DIRECTORY = process.env.MESSAGE_DIRECTORY || '/var/vectron';
+const TCP_PORT = process.env.TCP_PORT || 3554
 
 const IN = HOME_DIRECTORY + '/in'
 const WIP = HOME_DIRECTORY + '/wip'
@@ -41,8 +36,7 @@ mkdirp.sync(DONE);
 ////////////////////////////////////// Startup
 
 logString(`Starting: ${DEVICE_NAME}`);
-logString(`HTTP on ${HTTP_PORT}`);
-logString(`UDP on ${UDP_PORT}`);
+logString(`TCP on ${TCP_PORT}`);
 logString(`Working directory: ${HOME_DIRECTORY}`);
 
 if (GATEWAY) {
@@ -51,85 +45,52 @@ if (GATEWAY) {
   logString('API endpoint not defined. Messages will not be posted to an API Gateway');
 }
 
-if (MQTT_BROKER) {
-  logString(`MQTT broker: ${MQTT_BROKER}`);
-} else {
-  logString('MQTT broker not defined. Messages will not be published to MQTT.');
-}
-
-let mqttClient = null;
-if (MQTT_BROKER) { mqttClient = mqtt.connect(`mqtt://${MQTT_BROKER}`); }
-
 moveFiles(IN, RETRY);
 moveFiles(WIP, RETRY);
 
 setInterval(retry, 60000);
-setInterval(uploadCounts, 60000);
+setInterval(uploadCounts, 300000);
 
 
-////////////////////////////////////// UDP Submissions
+////////////////////////////////////// TCP Submissions
 
-const udp_server = datagram.createSocket('udp4');
+var server = net.createServer();
 
-udp_server.on('error', (err) => {
-  logString(`udp_server error:\n${err.stack}`);
-  udp_server.close();
+server.on('connection', conn => {
+
+  let remoteAddress = conn.remoteAddress + ':' + conn.remotePort;
+  let buffer = '';
+
+  console.log('New client connection from %s', remoteAddress);
+
+  conn.on('data', d => {
+    buffer += d;
+    if (buffer.length>10000) { buffer = ''; }
+  });
+
+  conn.once('close', e => {
+    let json = undefined;
+    try {
+      json = JSON.parse(buffer);
+    } catch (e) {
+      logString('Non JSON string: ' + buffer);
+    }
+    if (json) { write( { source: remoteAddress, payload: json } ); }
+    console.log('Connection from %s closed', remoteAddress)
+  });
+
+  conn.on('error', err => {
+    console.log('Connection %s error: %s', remoteAddress, err.message);
+  });
+
 });
 
-udp_server.on('message', (message, rinfo) => {
-  logString(`udp_server got: ${message} from ${rinfo.address}:${rinfo.port}`);
-  let udp_message = message.toString();
-  let index = udp_message.indexOf(' ');
-  let source = udp_message.substring(0, index).trim();
-  let payload = udp_message.substr(index + 1).trim();
-  write( { source: source, payload: payload } );
+server.listen(TCP_PORT, function() {    
+  console.log('Server listening to %j', server.address());  
 });
 
-udp_server.on('listening', () => {
-  const address = udp_server.address();
-  logString(`UDP listener listening on ${address.address}:${address.port}`);
-});
-
-udp_server.bind(UDP_PORT);
 
 
-////////////////////////////////////// Web Posts
-
-let http_server = express();
-let jsonParser = bodyParser.json({ type: function() {return true;} });
-
-http_server.set('port', HTTP_PORT);
-
-// either receive input as a complete body (JSON, with a 'source' tag), or
-// read the source from the query string.
-http_server.post('/', jsonParser, (request,response)=>{
-  logString(`http_server POST from ${request.ip}`);
-  let code = 202;
-  if (request.body['source']) {
-    write(request.body);
-  } else if (request.query['source']) {
-    write( { source: request.query['source'], payload: request.body } );
-  } else {
-    code = 400;
-  }
-  response.status(code).end();
-});
-
-// allow submission using get request and query string
-http_server.get('/', (request,response)=>{
-  logString(`http_server GET from ${request.ip}`);
-  let code = 202;
-  if (request.query['source']) {
-    write(request.query);
-  } else {
-    code = 400;
-  }
-  response.status(code).end();
-});
-
-http_server.listen(http_server.get('port'), ()=>{
-  logString('HTTP listener started on port ' + http_server.get('port'));
-});
 
 
 ////////////////////////////////////// File System watcher
@@ -149,7 +110,6 @@ watch_wip.on('change', function name(event, filename) {
         if (err) {
           logString('Unable to read file: ' + err); 
         } else {
-          if (mqttClient) { postMqtt(data) };
           if (GATEWAY) { postFile(filename, data) };
         }
       });
@@ -157,25 +117,18 @@ watch_wip.on('change', function name(event, filename) {
 });
 
 
-////////////////////////////////////// MQTT
-
-function postMqtt(data) {
-  json = JSON.parse(data);
-  mqttClient.publish(json.source, JSON.stringify(json.payload));
-}
-
 ////////////////////////////////////// Uploader
 
 function postFile(filename, data) {
   axios.post(GATEWAY, data, http_post_options)
   .then((res) => {
     let awsRequestId = res.headers['x-amzn-requestid'];
-    console.log(awsRequestId ? `Uploaded. Request ID: ${awsRequestId}` : 'Uploaded. No request id.')
+    logString(awsRequestId ? `Uploaded. Request ID: ${awsRequestId}` : 'Uploaded. No request id.')
     postSuccess(filename);
   })
   .catch((error) => {
     logString('Failed to relay ' + filename);
-    console.log(error);
+    logString(error);
     postFailure(filename);
   });
 }
